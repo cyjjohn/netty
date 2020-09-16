@@ -17,6 +17,7 @@ package io.netty.channel.uring;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.ByteBufHolder;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.AbstractChannel;
@@ -38,8 +39,6 @@ import io.netty.channel.socket.SocketChannelConfig;
 import io.netty.channel.unix.Buffer;
 import io.netty.channel.unix.Errors;
 import io.netty.channel.unix.FileDescriptor;
-import io.netty.channel.unix.IovArray;
-import io.netty.channel.unix.NativeInetAddress;
 import io.netty.channel.unix.Socket;
 import io.netty.channel.unix.UnixChannel;
 import io.netty.channel.unix.UnixChannelUtil;
@@ -48,8 +47,6 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.io.IOException;
-import java.net.Inet6Address;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
@@ -82,7 +79,6 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
 
     private ChannelPromise delayedClose;
     private boolean inputClosedSeenErrorOnRead;
-    static final int SOCK_ADDR_LEN = 128;
 
     /**
      * The future of the current connection attempt.  If not null, subsequent connection attempts will fail.
@@ -286,35 +282,20 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
         if (msgCount == 0) {
             return;
         }
-        ByteBuf msg = (ByteBuf) in.current();
-        if (msgCount > 1 ||
-                // We also need some special handling for CompositeByteBuf
-                msg.nioBufferCount() > 1) {
-            doWriteMultiple(in);
-        } else if (msgCount == 1) {
-            doWriteSingle(msg);
-        }
-    }
+        Object msg = in.current();
 
-     private void doWriteMultiple(ChannelOutboundBuffer in) {
-         final IovArray iovecArray = ((IOUringEventLoop) eventLoop()).iovArray();
-         try {
-             int offset = iovecArray.count();
-             in.forEachFlushedMessage(iovecArray);
-             submissionQueue().addWritev(socket.intValue(),
-                     iovecArray.memoryAddress(offset), iovecArray.count() - offset);
-             ioState |= WRITE_SCHEDULED;
-         } catch (Exception e) {
-             // This should never happen, anyway fallback to single write.
-             doWriteSingle((ByteBuf) in.current());
-         }
-     }
-
-    protected final void doWriteSingle(ByteBuf buf) {
         assert (ioState & WRITE_SCHEDULED) == 0;
-        IOUringSubmissionQueue submissionQueue = submissionQueue();
-        submissionQueue.addWrite(socket.intValue(), buf.memoryAddress(), buf.readerIndex(),
-                buf.writerIndex());
+        if (msgCount > 1) {
+            ioUringUnsafe().scheduleWriteMultiple(in);
+        } else {
+            // We also need some special handling for CompositeByteBuf
+            if ((msg instanceof ByteBuf) && ((ByteBuf) msg).nioBufferCount() > 1 ||
+                    ((msg instanceof ByteBufHolder) && ((ByteBufHolder) msg).content().nioBufferCount() > 1)) {
+                ioUringUnsafe().scheduleWriteMultiple(in);
+            } else {
+                ioUringUnsafe().scheduleWriteSingle(msg);
+            }
+        }
         ioState |= WRITE_SCHEDULED;
     }
 
@@ -333,8 +314,17 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
         ioState |= POLL_RDHUP_SCHEDULED;
     }
 
+    void resetCachedAddresses() {
+        local = socket.localAddress();
+        remote = socket.remoteAddress();
+    }
+
     abstract class AbstractUringUnsafe extends AbstractUnsafe {
         private IOUringRecvByteAllocatorHandle allocHandle;
+
+        protected abstract void scheduleWriteMultiple(ChannelOutboundBuffer in);
+
+        protected abstract void scheduleWriteSingle(Object msg);
 
         @Override
         public void close(ChannelPromise promise) {
@@ -583,7 +573,7 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
         final void writeComplete(int res) {
             ChannelOutboundBuffer channelOutboundBuffer = unsafe().outboundBuffer();
             if (res >= 0) {
-                channelOutboundBuffer.removeBytes(res);
+                removeFromOutboundBuffer(channelOutboundBuffer, res);
                 // We only reset this once we are done with calling removeBytes(...) as otherwise we may trigger a write
                 // while still removing messages internally in removeBytes(...) which then may corrupt state.
                 ioState &= ~WRITE_SCHEDULED;
@@ -601,7 +591,11 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
             }
         }
 
-        final void connectComplete(int res) {
+        protected void removeFromOutboundBuffer(ChannelOutboundBuffer outboundBuffer, int bytes) {
+            outboundBuffer.removeBytes(bytes);
+        }
+
+        void connectComplete(int res) {
             ioState &= ~CONNECT_SCHEDULED;
             freeRemoteAddressMemory();
 
@@ -646,19 +640,14 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
                 doConnect(remoteAddress, localAddress);
                 InetSocketAddress inetSocketAddress = (InetSocketAddress) remoteAddress;
 
-                remoteAddressMemory = Buffer.allocateDirectWithNativeOrder(SOCK_ADDR_LEN);
+                remoteAddressMemory = Buffer.allocateDirectWithNativeOrder(Native.SIZEOF_SOCKADDR_STORAGE);
                 long remoteAddressMemoryAddress = Buffer.memoryAddress(remoteAddressMemory);
 
-                if (socket.isIpv6()) {
-                    SockaddrIn.writeIPv6(remoteAddressMemoryAddress, inetSocketAddress.getAddress(),
-                            inetSocketAddress.getPort());
-                } else {
-                    SockaddrIn.writeIPv4(remoteAddressMemoryAddress, inetSocketAddress.getAddress(),
-                            inetSocketAddress.getPort());
-                }
+                SockaddrIn.write(socket.isIpv6(), remoteAddressMemoryAddress, inetSocketAddress);
 
                 final IOUringSubmissionQueue ioUringSubmissionQueue = submissionQueue();
-                ioUringSubmissionQueue.addConnect(socket.intValue(), remoteAddressMemoryAddress, SOCK_ADDR_LEN);
+                ioUringSubmissionQueue.addConnect(socket.intValue(), remoteAddressMemoryAddress,
+                        Native.SIZEOF_SOCKADDR_STORAGE);
                 ioState |= CONNECT_SCHEDULED;
             } catch (Throwable t) {
                 closeIfClosed();
@@ -731,7 +720,7 @@ abstract class AbstractIOUringChannel extends AbstractChannel implements UnixCha
     }
 
     @Override
-    public void doBind(final SocketAddress local) throws Exception {
+    protected void doBind(final SocketAddress local) throws Exception {
         if (local instanceof InetSocketAddress) {
             checkResolvable((InetSocketAddress) local);
         }
